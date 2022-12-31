@@ -19,4 +19,8 @@ Generics are great for when there is a solid algorithm that serves for many type
 
 But all in all, it was a great exercise to practice using generics. Maybe I will just use this library once or twice, maybe it will be actually useful for some. I am just in it for the ride. :)
 
+
+## Disclaimer
+
+This library will mirror all logic from Go's (standard) `io` library; and change the `[]byte` implementation with a generic `T any` and `[]T` implementation. There are no changes in the actual logic in the library.
 ________________
