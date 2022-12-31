@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/zalgonoise/x/gio"
+	. "github.com/zalgonoise/gio"
 )
 
 func checkWrite(t *testing.T, w Writer[byte], data []byte, c chan int) {

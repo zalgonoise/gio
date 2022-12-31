@@ -8,7 +8,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/zalgonoise/x/gio"
+	"github.com/zalgonoise/gio"
 )
 
 func ExampleCopy() {

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	. "github.com/zalgonoise/x/gio"
+	. "github.com/zalgonoise/gio"
 )
 
 // A version of bytes.Buffer without ReadFrom and WriteTo

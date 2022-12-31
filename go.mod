@@ -1,3 +1,3 @@
-module github.com/zalgonoise/x/gio
+module github.com/zalgonoise/gio
 
 go 1.19

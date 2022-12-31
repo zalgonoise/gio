@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/zalgonoise/x/gio"
+	. "github.com/zalgonoise/gio"
 )
 
 func TestMultiReader(t *testing.T) {
