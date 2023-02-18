@@ -90,7 +90,7 @@ func (p *pipe[T]) write(b []T) (n int, err error) {
 
 func (p *pipe[T]) closeWrite(err error) error {
 	if err == nil {
-		err = EOF
+		err = io.EOF
 	}
 	p.werr.Store(err)
 	p.once.Do(func() { close(p.done) })

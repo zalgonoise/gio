@@ -1,9 +1,11 @@
 package gio
 
+import "io"
+
 type eofReader[T any] struct{}
 
 func (eofReader[T]) Read([]T) (int, error) {
-	return 0, EOF
+	return 0, io.EOF
 }
 
 type multiReader[T any] struct {
@@ -20,21 +22,21 @@ func (mr *multiReader[T]) Read(p []T) (n int, err error) {
 			}
 		}
 		n, err = mr.readers[0].Read(p)
-		if err == EOF {
+		if err == io.EOF {
 			// Use eofReader instead of nil to avoid nil panic
 			// after performing flatten (Issue 18232).
 			mr.readers[0] = eofReader[T]{} // permit earlier GC
 			mr.readers = mr.readers[1:]
 		}
-		if n > 0 || err != EOF {
-			if err == EOF && len(mr.readers) > 0 {
+		if n > 0 || err != io.EOF {
+			if err == io.EOF && len(mr.readers) > 0 {
 				// Don't return EOF yet. More readers remain.
 				err = nil
 			}
 			return
 		}
 	}
-	return 0, EOF
+	return 0, io.EOF
 }
 
 func (mr *multiReader[T]) WriteTo(w Writer[T]) (sum int64, err error) {

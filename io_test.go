@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 
@@ -219,7 +220,7 @@ func TestCopyNEOF(t *testing.T) {
 	}
 
 	n, err = CopyN[byte](&noReadFrom[byte]{b}, strings.NewReader("foo"), 4)
-	if n != 3 || err != EOF {
+	if n != 3 || err != io.EOF {
 		t.Errorf("CopyN(noReadFrom, foo, 4) = %d, %v; want 3, EOF", n, err)
 	}
 
@@ -229,7 +230,7 @@ func TestCopyNEOF(t *testing.T) {
 	}
 
 	n, err = CopyN[byte](b, strings.NewReader("foo"), 4) // b has read from
-	if n != 3 || err != EOF {
+	if n != 3 || err != io.EOF {
 		t.Errorf("CopyN(bytes.Buffer, foo, 4) = %d, %v; want 3, EOF", n, err)
 	}
 
@@ -266,7 +267,7 @@ func (r *dataAndErrorBuffer) Read(p []byte) (n int, err error) {
 
 func TestReadAtLeastWithDataAndEOF(t *testing.T) {
 	var rb dataAndErrorBuffer
-	rb.err = EOF
+	rb.err = io.EOF
 	testReadAtLeast(t, &rb)
 }
 
@@ -301,7 +302,7 @@ func testReadAtLeast(t *testing.T, rb ReadWriter[byte]) {
 		t.Errorf("expected to have read 2 bytes, got %v", n)
 	}
 	n, err = ReadAtLeast[byte](rb, buf, 2)
-	if err != EOF {
+	if err != io.EOF {
 		t.Errorf("expected EOF, got %v", err)
 	}
 	if n != 0 {
@@ -310,7 +311,7 @@ func testReadAtLeast(t *testing.T, rb ReadWriter[byte]) {
 	rb.Write([]byte("4"))
 	n, err = ReadAtLeast[byte](rb, buf, 2)
 	want := ErrUnexpectedEOF
-	if rb, ok := rb.(*dataAndErrorBuffer); ok && rb.err != EOF {
+	if rb, ok := rb.(*dataAndErrorBuffer); ok && rb.err != io.EOF {
 		want = rb.err
 	}
 	if err != want {
@@ -336,7 +337,7 @@ func TestTeeReader(t *testing.T) {
 	if !bytes.Equal(wb.Bytes(), src) {
 		t.Errorf("bytes written = %q want %q", wb.Bytes(), src)
 	}
-	if n, err := r.Read(dst); n != 0 || err != EOF {
+	if n, err := r.Read(dst); n != 0 || err != io.EOF {
 		t.Errorf("r.Read at EOF = %d, %v want 0, EOF", n, err)
 	}
 	rb = bytes.NewBuffer(src)
@@ -359,18 +360,18 @@ func TestSectionReader_ReadAt(t *testing.T) {
 		exp    string
 		err    error
 	}{
-		{data: "", off: 0, n: 10, bufLen: 2, at: 0, exp: "", err: EOF},
+		{data: "", off: 0, n: 10, bufLen: 2, at: 0, exp: "", err: io.EOF},
 		{data: dat, off: 0, n: len(dat), bufLen: 0, at: 0, exp: "", err: nil},
-		{data: dat, off: len(dat), n: 1, bufLen: 1, at: 0, exp: "", err: EOF},
+		{data: dat, off: len(dat), n: 1, bufLen: 1, at: 0, exp: "", err: io.EOF},
 		{data: dat, off: 0, n: len(dat) + 2, bufLen: len(dat), at: 0, exp: dat, err: nil},
 		{data: dat, off: 0, n: len(dat), bufLen: len(dat) / 2, at: 0, exp: dat[:len(dat)/2], err: nil},
 		{data: dat, off: 0, n: len(dat), bufLen: len(dat), at: 0, exp: dat, err: nil},
 		{data: dat, off: 0, n: len(dat), bufLen: len(dat) / 2, at: 2, exp: dat[2 : 2+len(dat)/2], err: nil},
 		{data: dat, off: 3, n: len(dat), bufLen: len(dat) / 2, at: 2, exp: dat[5 : 5+len(dat)/2], err: nil},
 		{data: dat, off: 3, n: len(dat) / 2, bufLen: len(dat)/2 - 2, at: 2, exp: dat[5 : 5+len(dat)/2-2], err: nil},
-		{data: dat, off: 3, n: len(dat) / 2, bufLen: len(dat)/2 + 2, at: 2, exp: dat[5 : 5+len(dat)/2-2], err: EOF},
-		{data: dat, off: 0, n: 0, bufLen: 0, at: -1, exp: "", err: EOF},
-		{data: dat, off: 0, n: 0, bufLen: 0, at: 1, exp: "", err: EOF},
+		{data: dat, off: 3, n: len(dat) / 2, bufLen: len(dat)/2 + 2, at: 2, exp: dat[5 : 5+len(dat)/2-2], err: io.EOF},
+		{data: dat, off: 0, n: 0, bufLen: 0, at: -1, exp: "", err: io.EOF},
+		{data: dat, off: 0, n: 0, bufLen: 0, at: 1, exp: "", err: io.EOF},
 	}
 	for i, tt := range tests {
 		r := strings.NewReader(tt.data)
@@ -405,7 +406,7 @@ func TestSectionReader_Seek(t *testing.T) {
 	}
 
 	n, err := sr.Read(make([]byte, 10))
-	if n != 0 || err != EOF {
+	if n != 0 || err != io.EOF {
 		t.Errorf("Read = %v, %v; want 0, EOF", n, err)
 	}
 }
@@ -437,7 +438,7 @@ func TestSectionReader_Max(t *testing.T) {
 		t.Errorf("Read = %v %v, want 3, nil", n, err)
 	}
 	n, err = sr.Read(make([]byte, 3))
-	if n != 0 || err != EOF {
+	if n != 0 || err != io.EOF {
 		t.Errorf("Read = %v, %v, want 0, EOF", n, err)
 	}
 }

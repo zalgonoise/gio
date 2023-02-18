@@ -23,15 +23,6 @@ var ErrInvalidWrite = errors.New("invalid write result")
 // ErrShortBuffer means that a read required a longer buffer than was provided.
 var ErrShortBuffer = io.ErrShortBuffer
 
-// EOF is the error returned by Read when no more input is available.
-// (Read must return EOF itself, not an error wrapping EOF,
-// because callers will test for EOF using ==.)
-// Functions should return EOF only to signal a graceful end of input.
-// If the EOF occurs unexpectedly in a structured data stream,
-// the appropriate error is either ErrUnexpectedEOF or some other error
-// giving more detail.
-var EOF = io.EOF
-
 // ErrUnexpectedEOF means that EOF was encountered in the
 // middle of reading a fixed-size block or data structure.
 var ErrUnexpectedEOF = io.ErrUnexpectedEOF
@@ -282,7 +273,7 @@ func ReadAtLeast[T any](r Reader[T], buf []T, min int) (n int, err error) {
 	}
 	if n >= min {
 		err = nil
-	} else if n > 0 && err == EOF {
+	} else if n > 0 && err == io.EOF {
 		err = ErrUnexpectedEOF
 	}
 	return
@@ -313,7 +304,7 @@ func CopyN[T any](dst Writer[T], src Reader[T], n int64) (written int64, err err
 	}
 	if written < n && err == nil {
 		// src stopped early; must have been EOF.
-		err = EOF
+		err = io.EOF
 	}
 	return
 }
@@ -392,7 +383,7 @@ func copyBuffer[T any](dst Writer[T], src Reader[T], buf []T) (written int64, er
 			}
 		}
 		if er != nil {
-			if er != EOF {
+			if er != io.EOF {
 				err = er
 			}
 			break
@@ -417,7 +408,7 @@ type LimitedReader[T any] struct {
 
 func (l *LimitedReader[T]) Read(p []T) (n int, err error) {
 	if l.N <= 0 {
-		return 0, EOF
+		return 0, io.EOF
 	}
 	if int64(len(p)) > l.N {
 		p = p[0:l.N]
@@ -453,7 +444,7 @@ type SectionReader[T any] struct {
 
 func (s *SectionReader[T]) Read(p []T) (n int, err error) {
 	if s.off >= s.limit {
-		return 0, EOF
+		return 0, io.EOF
 	}
 	if max := s.limit - s.off; int64(len(p)) > max {
 		p = p[0:max]
@@ -486,14 +477,14 @@ func (s *SectionReader[T]) Seek(offset int64, whence int) (int64, error) {
 
 func (s *SectionReader[T]) ReadAt(p []T, off int64) (n int, err error) {
 	if off < 0 || off >= s.limit-s.base {
-		return 0, EOF
+		return 0, io.EOF
 	}
 	off += s.base
 	if max := s.limit - off; int64(len(p)) > max {
 		p = p[0:max]
 		n, err = s.r.ReadAt(p, off)
 		if err == nil {
-			err = EOF
+			err = io.EOF
 		}
 		return n, err
 	}
@@ -567,7 +558,7 @@ func (discard[T]) ReadFrom(r Reader[T]) (n int64, err error) {
 		n += int64(readSize)
 		if err != nil {
 			blackHolePool.Put(bufp)
-			if err == EOF {
+			if err == io.EOF {
 				return n, nil
 			}
 			return
@@ -617,7 +608,7 @@ func ReadAll[T any](r Reader[T]) ([]T, error) {
 		n, err := r.Read(b[len(b):cap(b)])
 		b = b[:len(b)+n]
 		if err != nil {
-			if err == EOF {
+			if err == io.EOF {
 				err = nil
 			}
 			return b, err

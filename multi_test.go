@@ -48,13 +48,13 @@ func TestMultiReader(t *testing.T) {
 		expectRead(2, "fo", nil)
 		expectRead(5, "o ", nil)
 		expectRead(5, "bar", nil)
-		expectRead(5, "", EOF)
+		expectRead(5, "", io.EOF)
 	})
 	withFooBar(func() {
 		expectRead(4, "foo ", nil)
 		expectRead(1, "b", nil)
 		expectRead(3, "ar", nil)
-		expectRead(1, "", EOF)
+		expectRead(1, "", io.EOF)
 	})
 	withFooBar(func() {
 		expectRead(5, "foo ", nil)
@@ -273,7 +273,7 @@ func (b byteAndEOFReader) Read(p []byte) (n int, err error) {
 		panic("unexpected call")
 	}
 	p[0] = byte(b)
-	return 1, EOF
+	return 1, io.EOF
 }
 
 // This used to yield bytes forever; issue 16795.
@@ -295,7 +295,7 @@ func TestMultiReaderFinalEOF(t *testing.T) {
 	r := MultiReader[byte](bytes.NewReader(nil), byteAndEOFReader('a'))
 	buf := make([]byte, 2)
 	n, err := r.Read(buf)
-	if n != 1 || err != EOF {
+	if n != 1 || err != io.EOF {
 		t.Errorf("got %v, %v; want 1, EOF", n, err)
 	}
 }

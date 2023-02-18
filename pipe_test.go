@@ -44,7 +44,7 @@ func reader(t *testing.T, r Reader[byte], c chan int) {
 	var buf = make([]byte, 64)
 	for {
 		n, err := r.Read(buf)
-		if err == EOF {
+		if err == io.EOF {
 			c <- 0
 			break
 		}
@@ -106,7 +106,7 @@ func TestPipe3(t *testing.T) {
 	tot := 0
 	for n := 1; n <= 256; n *= 2 {
 		nn, err := r.Read(rdat[tot : tot+n])
-		if err != nil && err != EOF {
+		if err != nil && err != io.EOF {
 			t.Fatalf("read: %v", err)
 		}
 
@@ -116,7 +116,7 @@ func TestPipe3(t *testing.T) {
 			expect = 1
 		} else if n == 256 {
 			expect = 0
-			if err != EOF {
+			if err != io.EOF {
 				t.Fatalf("read at end: %v", err)
 			}
 		}
@@ -193,7 +193,7 @@ func TestPipeReadClose(t *testing.T) {
 		<-c
 		want := tt.err
 		if want == nil {
-			want = EOF
+			want = io.EOF
 		}
 		if err != want {
 			t.Errorf("read from closed pipe: %v want %v", err, want)
