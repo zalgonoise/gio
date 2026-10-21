@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"github.com/zalgonoise/gio"
+	"github.com/zalgonoise/gio/v2"
 )
 
 // A version of bytes.Buffer without ReadFrom and WriteTo

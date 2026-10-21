@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"github.com/zalgonoise/gio"
+	"github.com/zalgonoise/gio/v2"
 )
 
 func checkWrite(t *testing.T, w gio.Writer[byte], data []byte, c chan int) {

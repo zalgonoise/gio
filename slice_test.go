@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"github.com/zalgonoise/gio"
+	"github.com/zalgonoise/gio/v2"
 )
 
 func TestSliceReader(t *testing.T) {

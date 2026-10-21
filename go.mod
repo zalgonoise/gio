@@ -1,4 +1,4 @@
-module github.com/zalgonoise/gio
+module github.com/zalgonoise/gio/v2
 
 go 1.27.1
 
