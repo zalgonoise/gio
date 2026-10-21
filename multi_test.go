@@ -11,222 +11,20 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/zalgonoise/gio"
+	"github.com/stretchr/testify/require"
+	"github.com/zalgonoise/gio"
 )
 
-func TestMultiReader(t *testing.T) {
-	var mr Reader[byte]
-	var buf []byte
-	nread := 0
-	withFooBar := func(tests func()) {
-		r1 := strings.NewReader("foo ")
-		r2 := strings.NewReader("")
-		r3 := strings.NewReader("bar")
-		mr = MultiReader[byte](r1, r2, r3)
-		buf = make([]byte, 20)
-		tests()
+type byteAndEOFReader byte
+
+func (b byteAndEOFReader) Read(p []byte) (n int, err error) {
+	if len(p) == 0 {
+		panic("unexpected call")
 	}
-	expectRead := func(size int, expected string, eerr error) {
-		nread++
-		n, gerr := mr.Read(buf[0:size])
-		if n != len(expected) {
-			t.Errorf("#%d, expected %d bytes; got %d",
-				nread, len(expected), n)
-		}
-		got := string(buf[0:n])
-		if got != expected {
-			t.Errorf("#%d, expected %q; got %q",
-				nread, expected, got)
-		}
-		if gerr != eerr {
-			t.Errorf("#%d, expected error %v; got %v",
-				nread, eerr, gerr)
-		}
-		buf = buf[n:]
-	}
-	withFooBar(func() {
-		expectRead(2, "fo", nil)
-		expectRead(5, "o ", nil)
-		expectRead(5, "bar", nil)
-		expectRead(5, "", io.EOF)
-	})
-	withFooBar(func() {
-		expectRead(4, "foo ", nil)
-		expectRead(1, "b", nil)
-		expectRead(3, "ar", nil)
-		expectRead(1, "", io.EOF)
-	})
-	withFooBar(func() {
-		expectRead(5, "foo ", nil)
-	})
+	p[0] = byte(b)
+	return 1, gio.EOF
 }
 
-func TestMultiReaderAsWriterTo(t *testing.T) {
-	mr := MultiReader[byte](
-		strings.NewReader("foo "),
-		MultiReader[byte]( // Tickle the buffer reusing codepath
-			strings.NewReader(""),
-			strings.NewReader("bar"),
-		),
-	)
-	mrAsWriterTo, ok := mr.(WriterTo[byte])
-	if !ok {
-		t.Fatalf("expected cast to WriterTo to succeed")
-	}
-	sink := &strings.Builder{}
-	n, err := mrAsWriterTo.WriteTo(sink)
-	if err != nil {
-		t.Fatalf("expected no error; got %v", err)
-	}
-	if n != 7 {
-		t.Errorf("expected read 7 bytes; got %d", n)
-	}
-	if result := sink.String(); result != "foo bar" {
-		t.Errorf(`expected "foo bar"; got %q`, result)
-	}
-}
-
-func TestMultiWriter(t *testing.T) {
-	sink := new(bytes.Buffer)
-	// Hide bytes.Buffer's WriteString method:
-	testMultiWriter(t, struct {
-		Writer[byte]
-		fmt.Stringer
-	}{sink, sink})
-}
-
-func TestMultiWriter_String(t *testing.T) {
-	testMultiWriter(t, new(bytes.Buffer))
-}
-
-// Test that a multiWriter.WriteString calls results in at most 1 allocation,
-// even if multiple targets don't support WriteString.
-func TestMultiWriter_WriteStringSingleAlloc(t *testing.T) {
-	var sink1, sink2 bytes.Buffer
-	type simpleWriter struct { // hide bytes.Buffer's WriteString
-		Writer[byte]
-	}
-	mw := MultiWriter[byte](simpleWriter{&sink1}, simpleWriter{&sink2})
-	allocs := int(testing.AllocsPerRun(1000, func() {
-		io.WriteString(mw, "foo")
-	}))
-	if allocs != 1 {
-		t.Errorf("num allocations = %d; want 1", allocs)
-	}
-}
-
-func testMultiWriter(t *testing.T, sink interface {
-	Writer[byte]
-	fmt.Stringer
-}) {
-	sha1 := sha1.New()
-	mw := MultiWriter[byte](sha1, sink)
-
-	sourceString := "My input text."
-	source := strings.NewReader(sourceString)
-	written, err := Copy[byte](mw, source)
-
-	if written != int64(len(sourceString)) {
-		t.Errorf("short write of %d, not %d", written, len(sourceString))
-	}
-
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-
-	sha1hex := fmt.Sprintf("%x", sha1.Sum(nil))
-	if sha1hex != "01cb303fa8c30a64123067c5aa6284ba7ec2d31b" {
-		t.Error("incorrect sha1 value")
-	}
-
-	if sink.String() != sourceString {
-		t.Errorf("expected %q; got %q", sourceString, sink.String())
-	}
-}
-
-// writerFunc is a Writer implemented by the underlying func.
-type writerFunc[T any] func(p []T) (int, error)
-
-func (f writerFunc[T]) Write(p []T) (int, error) {
-	return f(p)
-}
-
-// Test that MultiWriter properly flattens chained multiWriters.
-func TestMultiWriterSingleChainFlatten(t *testing.T) {
-	pc := make([]uintptr, 1000) // 1000 should fit the full stack
-	n := runtime.Callers(0, pc)
-	var myDepth = callDepth(pc[:n])
-	var writeDepth int // will contain the depth from which writerFunc.Writer was called
-	var w Writer[byte] = MultiWriter[byte](writerFunc[byte](func(p []byte) (int, error) {
-		n := runtime.Callers(1, pc)
-		writeDepth += callDepth(pc[:n])
-		return 0, nil
-	}))
-
-	mw := w
-	// chain a bunch of multiWriters
-	for i := 0; i < 100; i++ {
-		mw = MultiWriter(w)
-	}
-
-	mw = MultiWriter(w, mw, w, mw)
-	mw.Write(nil) // don't care about errors, just want to check the call-depth for Write
-
-	if writeDepth != 4*(myDepth+2) { // 2 should be multiWriter.Write and writerFunc.Write
-		t.Errorf("multiWriter did not flatten chained multiWriters: expected writeDepth %d, got %d",
-			4*(myDepth+2), writeDepth)
-	}
-}
-
-func TestMultiWriterError(t *testing.T) {
-	f1 := writerFunc[byte](func(p []byte) (int, error) {
-		return len(p) / 2, ErrShortWrite
-	})
-	f2 := writerFunc[byte](func(p []byte) (int, error) {
-		t.Errorf("MultiWriter called f2.Write")
-		return len(p), nil
-	})
-	w := MultiWriter[byte](f1, f2)
-	n, err := w.Write(make([]byte, 100))
-	if n != 50 || err != ErrShortWrite {
-		t.Errorf("Write = %d, %v, want 50, ErrShortWrite", n, err)
-	}
-}
-
-// Test that MultiReader copies the input slice and is insulated from future modification.
-func TestMultiReaderCopy(t *testing.T) {
-	slice := []Reader[byte]{strings.NewReader("hello world")}
-	r := MultiReader(slice...)
-	slice[0] = nil
-	data, err := ReadAll(r)
-	if err != nil || string(data) != "hello world" {
-		t.Errorf("ReadAll() = %q, %v, want %q, nil", data, err, "hello world")
-	}
-}
-
-// Test that MultiWriter copies the input slice and is insulated from future modification.
-func TestMultiWriterCopy(t *testing.T) {
-	var buf bytes.Buffer
-	slice := []Writer[byte]{&buf}
-	w := MultiWriter(slice...)
-	slice[0] = nil
-	n, err := w.Write([]byte("hello world"))
-	if err != nil || n != 11 {
-		t.Errorf("Write(`hello world`) = %d, %v, want 11, nil", n, err)
-	}
-	if buf.String() != "hello world" {
-		t.Errorf("buf.String() = %q, want %q", buf.String(), "hello world")
-	}
-}
-
-// readerFunc is a Reader implemented by the underlying func.
-type readerFunc[T any] func(p []T) (int, error)
-
-func (f readerFunc[T]) Read(p []T) (int, error) {
-	return f(p)
-}
-
-// callDepth returns the logical call depth for the given PCs.
 func callDepth(callers []uintptr) (depth int) {
 	frames := runtime.CallersFrames(callers)
 	more := true
@@ -237,121 +35,336 @@ func callDepth(callers []uintptr) (depth int) {
 	return
 }
 
-// Test that MultiReader properly flattens chained multiReaders when Read is called
-func TestMultiReaderFlatten(t *testing.T) {
-	pc := make([]uintptr, 1000) // 1000 should fit the full stack
-	n := runtime.Callers(0, pc)
-	var myDepth = callDepth(pc[:n])
-	var readDepth int // will contain the depth from which fakeReader.Read was called
-	var r Reader[byte] = MultiReader[byte](readerFunc[byte](func(p []byte) (int, error) {
-		n := runtime.Callers(1, pc)
-		readDepth = callDepth(pc[:n])
-		return 0, errors.New("irrelevant")
-	}))
+func TestMultiReader(t *testing.T) {
+	for _, testcase := range [...]struct {
+		name string
+		fn   func(t *testing.T)
+	}{
+		{
+			name: "SequentialReads",
+			fn: func(t *testing.T) {
+				var mr gio.Reader[byte]
+				var buf []byte
+				withFooBar := func(tests func()) {
+					r1 := strings.NewReader("foo ")
+					r2 := strings.NewReader("")
+					r3 := strings.NewReader("bar")
+					mr = gio.MultiReader[byte](r1, r2, r3)
+					buf = make([]byte, 20)
+					tests()
+				}
+				expectRead := func(size int, expected string, eerr error) {
+					n, gerr := mr.Read(buf[0:size])
+					require.Equal(t, len(expected), n)
+					require.Equal(t, expected, string(buf[0:n]))
+					require.Equal(t, eerr, gerr)
+					buf = buf[n:]
+				}
+				withFooBar(func() {
+					expectRead(2, "fo", nil)
+					expectRead(5, "o ", nil)
+					expectRead(5, "bar", nil)
+					expectRead(5, "", gio.EOF)
+				})
+				withFooBar(func() {
+					expectRead(4, "foo ", nil)
+					expectRead(1, "b", nil)
+					expectRead(3, "ar", nil)
+					expectRead(1, "", gio.EOF)
+				})
+				withFooBar(func() {
+					expectRead(5, "foo ", nil)
+				})
+			},
+		},
+		{
+			name: "AsWriterToAndResumeOnError",
+			fn: func(t *testing.T) {
+				mr := gio.MultiReader[byte](
+					strings.NewReader("foo "),
+					gio.MultiReader[byte](
+						strings.NewReader(""),
+						strings.NewReader("bar"),
+					),
+				)
+				mrAsWriterTo, ok := mr.(gio.WriterTo[byte])
+				require.True(t, ok)
 
-	// chain a bunch of multiReaders
-	for i := 0; i < 100; i++ {
-		r = MultiReader(r)
-	}
+				sink := &strings.Builder{}
+				n, err := mrAsWriterTo.WriteTo(sink)
+				require.NoError(t, err)
+				require.Equal(t, int64(7), n)
+				require.Equal(t, "foo bar", sink.String())
 
-	r.Read(nil) // don't care about errors, just want to check the call-depth for Read
+				// Test error mid-WriteTo
+				wantErr := errors.New("mid error")
+				mrErr := gio.MultiReader[int](
+					gio.NewReader([]int{1, 2}),
+					zeroErrReader[int]{err: wantErr},
+					gio.NewReader([]int{3, 4}),
+				)
+				dst := gio.NewSliceWriter[int](nil)
+				n, err = mrErr.(gio.WriterTo[int]).WriteTo(dst)
+				require.ErrorIs(t, err, wantErr)
+				require.Equal(t, int64(3), n)
+			},
+		},
+		{
+			name: "InputSliceCopyIsolation",
+			fn: func(t *testing.T) {
+				slice := []gio.Reader[byte]{strings.NewReader("hello world")}
+				r := gio.MultiReader(slice...)
+				slice[0] = nil
+				data, err := gio.ReadAll(r)
+				require.NoError(t, err)
+				require.Equal(t, "hello world", string(data))
+			},
+		},
+		{
+			name: "FlattenChainedMultiReaders",
+			fn: func(t *testing.T) {
+				pc := make([]uintptr, 1000)
+				n := runtime.Callers(0, pc)
+				myDepth := callDepth(pc[:n])
+				var readDepth int
+				var r gio.Reader[byte] = gio.MultiReader[byte](gio.ReaderFunc[byte](func(p []byte) (int, error) {
+					n := runtime.Callers(1, pc)
+					readDepth = callDepth(pc[:n])
+					return 0, errors.New("irrelevant")
+				}))
 
-	if readDepth != myDepth+2 { // 2 should be multiReader.Read and fakeReader.Read
-		t.Errorf("multiReader did not flatten chained multiReaders: expected readDepth %d, got %d",
-			myDepth+2, readDepth)
+				for i := 0; i < 100; i++ {
+					r = gio.MultiReader(r)
+				}
+				_, _ = r.Read(nil)
+				require.Equal(t, myDepth+2, readDepth)
+			},
+		},
+		{
+			name: "SingleByteWithEOFAndFinalEOF",
+			fn: func(t *testing.T) {
+				got, err := gio.ReadAll(gio.LimitReader(gio.MultiReader[byte](byteAndEOFReader('a'), byteAndEOFReader('b')), 10))
+				require.NoError(t, err)
+				require.Equal(t, "ab", string(got))
+
+				r := gio.MultiReader[byte](bytes.NewReader(nil), byteAndEOFReader('a'))
+				buf := make([]byte, 2)
+				n, err := r.Read(buf)
+				require.ErrorIs(t, err, gio.EOF)
+				require.Equal(t, 1, n)
+			},
+		},
+		{
+			name: "FreesExhaustedReaders",
+			fn: func(t *testing.T) {
+				var mr gio.Reader[byte]
+				closed := make(chan struct{})
+				func() {
+					buf1 := bytes.NewReader([]byte("foo"))
+					buf2 := bytes.NewReader([]byte("bar"))
+					mr = gio.MultiReader[byte](buf1, buf2)
+					runtime.SetFinalizer(buf1, func(*bytes.Reader) {
+						close(closed)
+					})
+				}()
+
+				buf := make([]byte, 4)
+				n, err := gio.ReadFull(mr, buf)
+				require.NoError(t, err)
+				require.Equal(t, 4, n)
+				require.Equal(t, "foob", string(buf))
+
+				runtime.GC()
+				select {
+				case <-closed:
+				case <-time.After(5 * time.Second):
+					t.Fatal("timeout waiting for collection of buf1")
+				}
+
+				n, err = gio.ReadFull(mr, buf[:2])
+				require.NoError(t, err)
+				require.Equal(t, 2, n)
+				require.Equal(t, "ar", string(buf[:2]))
+			},
+		},
+		{
+			name: "InterleavedMultiReader",
+			fn: func(t *testing.T) {
+				r1 := strings.NewReader("123")
+				r2 := strings.NewReader("45678")
+
+				mr1 := gio.MultiReader[byte](r1, r2)
+				mr2 := gio.MultiReader[byte](mr1)
+
+				buf := make([]byte, 4)
+				n, err := gio.ReadFull(mr2, buf)
+				require.NoError(t, err)
+				require.Equal(t, "1234", string(buf[:n]))
+
+				n, err = gio.ReadFull(mr1, buf)
+				require.NoError(t, err)
+				require.Equal(t, "5678", string(buf[:n]))
+			},
+		},
+	} {
+		t.Run(testcase.name, testcase.fn)
 	}
 }
 
-// byteAndEOFReader is a Reader which reads one byte (the underlying
-// byte) and EOF at once in its Read call.
-type byteAndEOFReader byte
+func testMultiWriter(t *testing.T, sink interface {
+	gio.Writer[byte]
+	fmt.Stringer
+}) {
+	h := sha1.New()
+	mw := gio.MultiWriter[byte](h, sink)
 
-func (b byteAndEOFReader) Read(p []byte) (n int, err error) {
-	if len(p) == 0 {
-		// Read(0 bytes) is useless. We expect no such useless
-		// calls in this test.
-		panic("unexpected call")
-	}
-	p[0] = byte(b)
-	return 1, io.EOF
+	sourceString := "My input text."
+	source := strings.NewReader(sourceString)
+	written, err := gio.Copy[byte](mw, source)
+
+	require.NoError(t, err)
+	require.Equal(t, int64(len(sourceString)), written)
+	require.Equal(t, "01cb303fa8c30a64123067c5aa6284ba7ec2d31b", fmt.Sprintf("%x", h.Sum(nil)))
+	require.Equal(t, sourceString, sink.String())
 }
 
-// This used to yield bytes forever; issue 16795.
-func TestMultiReaderSingleByteWithEOF(t *testing.T) {
-	got, err := ReadAll(LimitReader(MultiReader[byte](byteAndEOFReader('a'), byteAndEOFReader('b')), 10))
-	if err != nil {
-		t.Fatal(err)
-	}
-	const want = "ab"
-	if string(got) != want {
-		t.Errorf("got %q; want %q", got, want)
-	}
-}
+type shortStringWriter struct{}
 
-// Test that a reader returning (n, EOF) at the end of a MultiReader
-// chain continues to return EOF on its final read, rather than
-// yielding a (0, EOF).
-func TestMultiReaderFinalEOF(t *testing.T) {
-	r := MultiReader[byte](bytes.NewReader(nil), byteAndEOFReader('a'))
-	buf := make([]byte, 2)
-	n, err := r.Read(buf)
-	if n != 1 || err != io.EOF {
-		t.Errorf("got %v, %v; want 1, EOF", n, err)
-	}
-}
+func (shortStringWriter) Write(p []byte) (int, error)       { return len(p), nil }
+func (shortStringWriter) WriteString(s string) (int, error) { return len(s) - 1, nil }
 
-func TestMultiReaderFreesExhaustedReaders(t *testing.T) {
-	var mr Reader[byte]
-	closed := make(chan struct{})
-	// The closure ensures that we don't have a live reference to buf1
-	// on our stack after MultiReader is inlined (Issue 18819).  This
-	// is a work around for a limitation in liveness analysis.
-	func() {
-		buf1 := bytes.NewReader([]byte("foo"))
-		buf2 := bytes.NewReader([]byte("bar"))
-		mr = MultiReader[byte](buf1, buf2)
-		runtime.SetFinalizer(buf1, func(*bytes.Reader) {
-			close(closed)
-		})
-	}()
+func TestMultiWriter(t *testing.T) {
+	for _, testcase := range [...]struct {
+		name string
+		fn   func(t *testing.T)
+	}{
+		{
+			name: "WithoutStringWriter",
+			fn: func(t *testing.T) {
+				sink := new(bytes.Buffer)
+				testMultiWriter(t, struct {
+					gio.Writer[byte]
+					fmt.Stringer
+				}{sink, sink})
+			},
+		},
+		{
+			name: "WithStringWriter",
+			fn: func(t *testing.T) {
+				testMultiWriter(t, new(bytes.Buffer))
+			},
+		},
+		{
+			name: "WriteStringZeroAllocAndSingleAlloc",
+			fn: func(t *testing.T) {
+				var sink1, sink2 bytes.Buffer
+				mwZero := gio.MultiWriter[byte](&sink1, &sink2)
+				allocsZero := int(testing.AllocsPerRun(1000, func() {
+					_, _ = io.WriteString(mwZero, "foo")
+				}))
+				require.Zero(t, allocsZero)
 
-	buf := make([]byte, 4)
-	if n, err := ReadFull(mr, buf); err != nil || string(buf) != "foob" {
-		t.Fatalf(`ReadFull = %d (%q), %v; want 3, "foo", nil`, n, buf[:n], err)
-	}
+				type simpleWriter struct {
+					gio.Writer[byte]
+				}
+				mwOne := gio.MultiWriter[byte](simpleWriter{&sink1}, simpleWriter{&sink2})
+				allocsOne := int(testing.AllocsPerRun(1000, func() {
+					_, _ = io.WriteString(mwOne, "foo")
+				}))
+				require.Equal(t, 1, allocsOne)
+			},
+		},
+		{
+			name: "WriteStringErrors",
+			fn: func(t *testing.T) {
+				mwShort := gio.MultiWriter[byte](shortStringWriter{})
+				_, err := gio.WriteString(mwShort, "hello")
+				require.ErrorIs(t, err, gio.ErrShortWrite)
 
-	runtime.GC()
-	select {
-	case <-closed:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for collection of buf1")
-	}
+				wantErr := errors.New("write error")
+				mwErr := gio.MultiWriter[byte](errWriter[byte]{err: wantErr})
+				_, err = gio.WriteString(mwErr, "hello")
+				require.ErrorIs(t, err, wantErr)
 
-	if n, err := ReadFull(mr, buf[:2]); err != nil || string(buf[:2]) != "ar" {
-		t.Fatalf(`ReadFull = %d (%q), %v; want 2, "ar", nil`, n, buf[:n], err)
-	}
-}
+				// Non-byte MultiWriter calling WriteString returns ErrInvalidWrite
+				mwInt := gio.MultiWriter[int](gio.NewSliceWriter[int](nil))
+				_, err = mwInt.(gio.StringWriter).WriteString("hello")
+				require.ErrorIs(t, err, gio.ErrInvalidWrite)
+			},
+		},
+		{
+			name: "WriteItemFanOut",
+			fn: func(t *testing.T) {
+				w1 := gio.NewSliceWriter[int](nil)
+				w2 := gio.NewSliceWriter[int](nil)
+				mw := gio.MultiWriter(w1, w2)
 
-func TestInterleavedMultiReader(t *testing.T) {
-	r1 := strings.NewReader("123")
-	r2 := strings.NewReader("45678")
+				require.NoError(t, gio.WriteItem(mw, 77))
+				require.Equal(t, []int{77}, w1.Slice())
+				require.Equal(t, []int{77}, w2.Slice())
 
-	mr1 := MultiReader[byte](r1, r2)
-	mr2 := MultiReader[byte](mr1)
+				wantErr := errors.New("item fail")
+				mwErr := gio.MultiWriter[int](w1, errWriter[int]{err: wantErr})
+				require.ErrorIs(t, gio.WriteItem(mwErr, 88), wantErr)
+			},
+		},
+		{
+			name: "SingleChainFlatten",
+			fn: func(t *testing.T) {
+				pc := make([]uintptr, 1000)
+				n := runtime.Callers(0, pc)
+				myDepth := callDepth(pc[:n])
+				var writeDepth int
+				var w gio.Writer[byte] = gio.MultiWriter[byte](gio.WriterFunc[byte](func(p []byte) (int, error) {
+					n := runtime.Callers(1, pc)
+					writeDepth += callDepth(pc[:n])
+					return 0, nil
+				}))
 
-	buf := make([]byte, 4)
+				mw := w
+				for i := 0; i < 100; i++ {
+					mw = gio.MultiWriter(w)
+				}
 
-	// Have mr2 use mr1's []Readers.
-	// Consume r1 (and clear it for GC to handle) and consume part of r2.
-	n, err := ReadFull(mr2, buf)
-	if got := string(buf[:n]); got != "1234" || err != nil {
-		t.Errorf(`ReadFull(mr2) = (%q, %v), want ("1234", nil)`, got, err)
-	}
+				mw = gio.MultiWriter(w, mw, w, mw)
+				_, _ = mw.Write(nil)
+				require.Equal(t, 4*(myDepth+2), writeDepth)
+			},
+		},
+		{
+			name: "WriteErrorAndShortWrite",
+			fn: func(t *testing.T) {
+				f1 := gio.WriterFunc[byte](func(p []byte) (int, error) {
+					return len(p) / 2, gio.ErrShortWrite
+				})
+				f2 := gio.WriterFunc[byte](func(p []byte) (int, error) {
+					t.Errorf("MultiWriter called f2.Write")
+					return len(p), nil
+				})
+				w := gio.MultiWriter[byte](f1, f2)
+				n, err := w.Write(make([]byte, 100))
+				require.ErrorIs(t, err, gio.ErrShortWrite)
+				require.Equal(t, 50, n)
 
-	// Consume the rest of r2 via mr1.
-	// This should not panic even though mr2 cleared r1.
-	n, err = ReadFull(mr1, buf)
-	if got := string(buf[:n]); got != "5678" || err != nil {
-		t.Errorf(`ReadFull(mr1) = (%q, %v), want ("5678", nil)`, got, err)
+				wShort := gio.MultiWriter[int](shortWriter[int]{})
+				_, err = wShort.Write([]int{1, 2, 3})
+				require.ErrorIs(t, err, gio.ErrShortWrite)
+			},
+		},
+		{
+			name: "InputSliceCopyIsolation",
+			fn: func(t *testing.T) {
+				var buf bytes.Buffer
+				slice := []gio.Writer[byte]{&buf}
+				w := gio.MultiWriter(slice...)
+				slice[0] = nil
+				n, err := w.Write([]byte("hello world"))
+				require.NoError(t, err)
+				require.Equal(t, 11, n)
+				require.Equal(t, "hello world", buf.String())
+			},
+		},
+	} {
+		t.Run(testcase.name, testcase.fn)
 	}
 }

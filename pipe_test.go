@@ -9,76 +9,27 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/zalgonoise/gio"
+	"github.com/stretchr/testify/require"
+	"github.com/zalgonoise/gio"
 )
 
-func checkWrite(t *testing.T, w Writer[byte], data []byte, c chan int) {
+func checkWrite(t *testing.T, w gio.Writer[byte], data []byte, c chan int) {
 	n, err := w.Write(data)
-	if err != nil {
-		t.Errorf("write: %v", err)
-	}
-	if n != len(data) {
-		t.Errorf("short write: %d != %d", n, len(data))
-	}
+	require.NoError(t, err)
+	require.Equal(t, len(data), n)
 	c <- 0
 }
 
-// Test a single read/write pair.
-func TestPipe1(t *testing.T) {
-	c := make(chan int)
-	r, w := Pipe[byte]()
-	var buf = make([]byte, 64)
-	go checkWrite(t, w, []byte("hello, world"), c)
-	n, err := r.Read(buf)
-	if err != nil {
-		t.Errorf("read: %v", err)
-	} else if n != 12 || string(buf[0:12]) != "hello, world" {
-		t.Errorf("bad read: got %q", buf[0:n])
-	}
-	<-c
-	r.Close()
-	w.Close()
-}
-
-func reader(t *testing.T, r Reader[byte], c chan int) {
-	var buf = make([]byte, 64)
+func reader(t *testing.T, r gio.Reader[byte], c chan int) {
+	buf := make([]byte, 64)
 	for {
 		n, err := r.Read(buf)
-		if err == io.EOF {
+		if err == gio.EOF {
 			c <- 0
 			break
 		}
-		if err != nil {
-			t.Errorf("read: %v", err)
-		}
+		require.NoError(t, err)
 		c <- n
-	}
-}
-
-// Test a sequence of read/write pairs.
-func TestPipe2(t *testing.T) {
-	c := make(chan int)
-	r, w := Pipe[byte]()
-	go reader(t, r, c)
-	var buf = make([]byte, 64)
-	for i := 0; i < 5; i++ {
-		p := buf[0 : 5+i*10]
-		n, err := w.Write(p)
-		if n != len(p) {
-			t.Errorf("wrote %d, got %d", len(p), n)
-		}
-		if err != nil {
-			t.Errorf("write: %v", err)
-		}
-		nn := <-c
-		if nn != n {
-			t.Errorf("wrote %d, read got %d", n, nn)
-		}
-	}
-	w.Close()
-	nn := <-c
-	if nn != 0 {
-		t.Errorf("final read got %d", nn)
 	}
 }
 
@@ -87,59 +38,11 @@ type pipeReturn struct {
 	err error
 }
 
-// Test a large write that requires multiple reads to satisfy.
-func writer(w WriteCloser[byte], buf []byte, c chan pipeReturn) {
+func writer(w gio.WriteCloser[byte], buf []byte, c chan pipeReturn) {
 	n, err := w.Write(buf)
-	w.Close()
+	_ = w.Close()
 	c <- pipeReturn{n, err}
 }
-
-func TestPipe3(t *testing.T) {
-	c := make(chan pipeReturn)
-	r, w := Pipe[byte]()
-	var wdat = make([]byte, 128)
-	for i := 0; i < len(wdat); i++ {
-		wdat[i] = byte(i)
-	}
-	go writer(w, wdat, c)
-	var rdat = make([]byte, 1024)
-	tot := 0
-	for n := 1; n <= 256; n *= 2 {
-		nn, err := r.Read(rdat[tot : tot+n])
-		if err != nil && err != io.EOF {
-			t.Fatalf("read: %v", err)
-		}
-
-		// only final two reads should be short - 1 byte, then 0
-		expect := n
-		if n == 128 {
-			expect = 1
-		} else if n == 256 {
-			expect = 0
-			if err != io.EOF {
-				t.Fatalf("read at end: %v", err)
-			}
-		}
-		if nn != expect {
-			t.Fatalf("read %d, expected %d, got %d", n, expect, nn)
-		}
-		tot += nn
-	}
-	pr := <-c
-	if pr.n != 128 || pr.err != nil {
-		t.Fatalf("write 128: %d, %v", pr.n, pr.err)
-	}
-	if tot != 128 {
-		t.Fatalf("total read %d != 128", tot)
-	}
-	for i := 0; i < 128; i++ {
-		if rdat[i] != byte(i) {
-			t.Fatalf("rdat[%d] = %d", i, rdat[i])
-		}
-	}
-}
-
-// Test read after/before writer close.
 
 type closer interface {
 	CloseWithError(error) error
@@ -159,10 +62,10 @@ func (p pipeTest) String() string {
 var pipeTests = []pipeTest{
 	{true, nil, false},
 	{true, nil, true},
-	{true, ErrShortWrite, true},
+	{true, gio.ErrShortWrite, true},
 	{false, nil, false},
 	{false, nil, true},
-	{false, ErrShortWrite, true},
+	{false, gio.ErrShortWrite, true},
 }
 
 func delayClose(t *testing.T, cl closer, ch chan int, tt pipeTest) {
@@ -173,241 +76,8 @@ func delayClose(t *testing.T, cl closer, ch chan int, tt pipeTest) {
 	} else {
 		err = cl.Close()
 	}
-	if err != nil {
-		t.Errorf("delayClose: %v", err)
-	}
+	require.NoError(t, err)
 	ch <- 0
-}
-
-func TestPipeReadClose(t *testing.T) {
-	for _, tt := range pipeTests {
-		c := make(chan int, 1)
-		r, w := Pipe[byte]()
-		if tt.async {
-			go delayClose(t, w, c, tt)
-		} else {
-			delayClose(t, w, c, tt)
-		}
-		var buf = make([]byte, 64)
-		n, err := r.Read(buf)
-		<-c
-		want := tt.err
-		if want == nil {
-			want = io.EOF
-		}
-		if err != want {
-			t.Errorf("read from closed pipe: %v want %v", err, want)
-		}
-		if n != 0 {
-			t.Errorf("read on closed pipe returned %d", n)
-		}
-		if err = r.Close(); err != nil {
-			t.Errorf("r.Close: %v", err)
-		}
-	}
-}
-
-// Test close on Read side during Read.
-func TestPipeReadClose2(t *testing.T) {
-	c := make(chan int, 1)
-	r, _ := Pipe[byte]()
-	go delayClose(t, r, c, pipeTest{})
-	n, err := r.Read(make([]byte, 64))
-	<-c
-	if n != 0 || err != ErrClosedPipe {
-		t.Errorf("read from closed pipe: %v, %v want %v, %v", n, err, 0, ErrClosedPipe)
-	}
-}
-
-// Test write after/before reader close.
-
-func TestPipeWriteClose(t *testing.T) {
-	for _, tt := range pipeTests {
-		c := make(chan int, 1)
-		r, w := Pipe[byte]()
-		if tt.async {
-			go delayClose(t, r, c, tt)
-		} else {
-			delayClose(t, r, c, tt)
-		}
-		n, err := io.WriteString((io.Writer)(w), "hello, world")
-		<-c
-		expect := tt.err
-		if expect == nil {
-			expect = ErrClosedPipe
-		}
-		if err != expect {
-			t.Errorf("write on closed pipe: %v want %v", err, expect)
-		}
-		if n != 0 {
-			t.Errorf("write on closed pipe returned %d", n)
-		}
-		if err = w.Close(); err != nil {
-			t.Errorf("w.Close: %v", err)
-		}
-	}
-}
-
-// Test close on Write side during Write.
-func TestPipeWriteClose2(t *testing.T) {
-	c := make(chan int, 1)
-	_, w := Pipe[byte]()
-	go delayClose(t, w, c, pipeTest{})
-	n, err := w.Write(make([]byte, 64))
-	<-c
-	if n != 0 || err != ErrClosedPipe {
-		t.Errorf("write to closed pipe: %v, %v want %v, %v", n, err, 0, ErrClosedPipe)
-	}
-}
-
-func TestWriteEmpty(t *testing.T) {
-	r, w := Pipe[byte]()
-	go func() {
-		w.Write([]byte{})
-		w.Close()
-	}()
-	var b [2]byte
-	ReadFull((Reader[byte])(r), b[0:2])
-	r.Close()
-}
-
-func TestWriteNil(t *testing.T) {
-	r, w := Pipe[byte]()
-	go func() {
-		w.Write(nil)
-		w.Close()
-	}()
-	var b [2]byte
-	ReadFull((Reader[byte])(r), b[0:2])
-	r.Close()
-}
-
-func TestWriteAfterWriterClose(t *testing.T) {
-	r, w := Pipe[byte]()
-
-	done := make(chan bool)
-	var writeErr error
-	go func() {
-		_, err := w.Write([]byte("hello"))
-		if err != nil {
-			t.Errorf("got error: %q; expected none", err)
-		}
-		w.Close()
-		_, writeErr = w.Write([]byte("world"))
-		done <- true
-	}()
-
-	buf := make([]byte, 100)
-	var result string
-	n, err := ReadFull((Reader[byte])(r), buf)
-	if err != nil && err != ErrUnexpectedEOF {
-		t.Fatalf("got: %q; want: %q", err, ErrUnexpectedEOF)
-	}
-	result = string(buf[0:n])
-	<-done
-
-	if result != "hello" {
-		t.Errorf("got: %q; want: %q", result, "hello")
-	}
-	if writeErr != ErrClosedPipe {
-		t.Errorf("got: %q; want: %q", writeErr, ErrClosedPipe)
-	}
-}
-
-func TestPipeCloseError(t *testing.T) {
-	type testError1 struct{ error }
-	type testError2 struct{ error }
-
-	r, w := Pipe[byte]()
-	r.CloseWithError(testError1{})
-	if _, err := w.Write(nil); err != (testError1{}) {
-		t.Errorf("Write error: got %T, want testError1", err)
-	}
-	r.CloseWithError(testError2{})
-	if _, err := w.Write(nil); err != (testError1{}) {
-		t.Errorf("Write error: got %T, want testError1", err)
-	}
-
-	r, w = Pipe[byte]()
-	w.CloseWithError(testError1{})
-	if _, err := r.Read(nil); err != (testError1{}) {
-		t.Errorf("Read error: got %T, want testError1", err)
-	}
-	w.CloseWithError(testError2{})
-	if _, err := r.Read(nil); err != (testError1{}) {
-		t.Errorf("Read error: got %T, want testError1", err)
-	}
-}
-
-func TestPipeConcurrent(t *testing.T) {
-	const (
-		input    = "0123456789abcdef"
-		count    = 8
-		readSize = 2
-	)
-
-	t.Run("Write", func(t *testing.T) {
-		r, w := Pipe[byte]()
-
-		for i := 0; i < count; i++ {
-			go func() {
-				time.Sleep(time.Millisecond) // Increase probability of race
-				if n, err := w.Write([]byte(input)); n != len(input) || err != nil {
-					t.Errorf("Write() = (%d, %v); want (%d, nil)", n, err, len(input))
-				}
-			}()
-		}
-
-		buf := make([]byte, count*len(input))
-		for i := 0; i < len(buf); i += readSize {
-			if n, err := r.Read(buf[i : i+readSize]); n != readSize || err != nil {
-				t.Errorf("Read() = (%d, %v); want (%d, nil)", n, err, readSize)
-			}
-		}
-
-		// Since each Write is fully gated, if multiple Read calls were needed,
-		// the contents of Write should still appear together in the output.
-		got := string(buf)
-		want := strings.Repeat(input, count)
-		if got != want {
-			t.Errorf("got: %q; want: %q", got, want)
-		}
-	})
-
-	t.Run("Read", func(t *testing.T) {
-		r, w := Pipe[byte]()
-
-		c := make(chan []byte, count*len(input)/readSize)
-		for i := 0; i < cap(c); i++ {
-			go func() {
-				time.Sleep(time.Millisecond) // Increase probability of race
-				buf := make([]byte, readSize)
-				if n, err := r.Read(buf); n != readSize || err != nil {
-					t.Errorf("Read() = (%d, %v); want (%d, nil)", n, err, readSize)
-				}
-				c <- buf
-			}()
-		}
-
-		for i := 0; i < count; i++ {
-			if n, err := w.Write([]byte(input)); n != len(input) || err != nil {
-				t.Errorf("Write() = (%d, %v); want (%d, nil)", n, err, len(input))
-			}
-		}
-
-		// Since each read is independent, the only guarantee about the output
-		// is that it is a permutation of the input in readSized groups.
-		got := make([]byte, 0, count*len(input))
-		for i := 0; i < cap(c); i++ {
-			got = append(got, (<-c)...)
-		}
-		got = sortBytesInGroups(got, readSize)
-		want := bytes.Repeat([]byte(input), count)
-		want = sortBytesInGroups(want, readSize)
-		if string(got) != string(want) {
-			t.Errorf("got: %q; want: %q", got, want)
-		}
-	})
 }
 
 func sortBytesInGroups(b []byte, n int) []byte {
@@ -418,4 +88,406 @@ func sortBytesInGroups(b []byte, n int) []byte {
 	}
 	sort.Slice(groups, func(i, j int) bool { return bytes.Compare(groups[i], groups[j]) < 0 })
 	return bytes.Join(groups, nil)
+}
+
+func TestPipe(t *testing.T) {
+	for _, testcase := range [...]struct {
+		name string
+		fn   func(t *testing.T)
+	}{
+		{
+			name: "SingleReadWritePair",
+			fn: func(t *testing.T) {
+				c := make(chan int)
+				r, w := gio.Pipe[byte]()
+				buf := make([]byte, 64)
+				go checkWrite(t, w, []byte("hello, world"), c)
+				n, err := r.Read(buf)
+				require.NoError(t, err)
+				require.Equal(t, 12, n)
+				require.Equal(t, "hello, world", string(buf[0:12]))
+				<-c
+				require.NoError(t, r.Close())
+				require.NoError(t, w.Close())
+			},
+		},
+		{
+			name: "SequenceOfReadWritePairs",
+			fn: func(t *testing.T) {
+				c := make(chan int)
+				r, w := gio.Pipe[byte]()
+				go reader(t, r, c)
+				buf := make([]byte, 64)
+				for i := 0; i < 5; i++ {
+					p := buf[0 : 5+i*10]
+					n, err := w.Write(p)
+					require.NoError(t, err)
+					require.Equal(t, len(p), n)
+					nn := <-c
+					require.Equal(t, n, nn)
+				}
+				require.NoError(t, w.Close())
+				nn := <-c
+				require.Zero(t, nn)
+			},
+		},
+		{
+			name: "LargeWriteMultipleReads",
+			fn: func(t *testing.T) {
+				c := make(chan pipeReturn)
+				r, w := gio.Pipe[byte]()
+				wdat := make([]byte, 128)
+				for i := 0; i < len(wdat); i++ {
+					wdat[i] = byte(i)
+				}
+				go writer(w, wdat, c)
+				rdat := make([]byte, 1024)
+				tot := 0
+				for n := 1; n <= 256; n *= 2 {
+					nn, err := r.Read(rdat[tot : tot+n])
+					if err != nil {
+						require.ErrorIs(t, err, gio.EOF)
+					}
+					expect := n
+					if n == 128 {
+						expect = 1
+					} else if n == 256 {
+						expect = 0
+						require.ErrorIs(t, err, gio.EOF)
+					}
+					require.Equal(t, expect, nn)
+					tot += nn
+				}
+				pr := <-c
+				require.NoError(t, pr.err)
+				require.Equal(t, 128, pr.n)
+				require.Equal(t, 128, tot)
+				for i := 0; i < 128; i++ {
+					require.Equal(t, byte(i), rdat[i])
+				}
+			},
+		},
+		{
+			name: "ReadItemAndWriteItem",
+			fn: func(t *testing.T) {
+				r, w := gio.Pipe[int]()
+				go func() {
+					require.NoError(t, w.WriteItem(42))
+					require.NoError(t, w.Close())
+				}()
+				v, err := r.ReadItem()
+				require.NoError(t, err)
+				require.Equal(t, 42, v)
+				_, err = r.ReadItem()
+				require.ErrorIs(t, err, gio.EOF)
+			},
+		},
+		{
+			name: "PipeReadClose",
+			fn: func(t *testing.T) {
+				for _, tt := range pipeTests {
+					c := make(chan int, 1)
+					r, w := gio.Pipe[byte]()
+					if tt.async {
+						go delayClose(t, w, c, tt)
+					} else {
+						delayClose(t, w, c, tt)
+					}
+					buf := make([]byte, 64)
+					n, err := r.Read(buf)
+					<-c
+					want := tt.err
+					if want == nil {
+						want = gio.EOF
+					}
+					require.ErrorIs(t, err, want)
+					require.Zero(t, n)
+					require.NoError(t, r.Close())
+				}
+			},
+		},
+		{
+			name: "PipeReadCloseDuringRead",
+			fn: func(t *testing.T) {
+				c := make(chan int, 1)
+				r, _ := gio.Pipe[byte]()
+				go delayClose(t, r, c, pipeTest{})
+				n, err := r.Read(make([]byte, 64))
+				<-c
+				require.ErrorIs(t, err, gio.ErrClosedPipe)
+				require.Zero(t, n)
+			},
+		},
+		{
+			name: "PipeWriteClose",
+			fn: func(t *testing.T) {
+				for _, tt := range pipeTests {
+					c := make(chan int, 1)
+					r, w := gio.Pipe[byte]()
+					if tt.async {
+						go delayClose(t, r, c, tt)
+					} else {
+						delayClose(t, r, c, tt)
+					}
+					n, err := io.WriteString(w, "hello, world")
+					<-c
+					expect := tt.err
+					if expect == nil {
+						expect = gio.ErrClosedPipe
+					}
+					require.ErrorIs(t, err, expect)
+					require.Zero(t, n)
+					require.NoError(t, w.Close())
+				}
+			},
+		},
+		{
+			name: "PipeWriteCloseDuringWrite",
+			fn: func(t *testing.T) {
+				c := make(chan int, 1)
+				_, w := gio.Pipe[byte]()
+				go delayClose(t, w, c, pipeTest{})
+				n, err := w.Write(make([]byte, 64))
+				<-c
+				require.ErrorIs(t, err, gio.ErrClosedPipe)
+				require.Zero(t, n)
+			},
+		},
+		{
+			name: "WriteEmptyAndNil",
+			fn: func(t *testing.T) {
+				r, w := gio.Pipe[byte]()
+				go func() {
+					_, _ = w.Write([]byte{})
+					_ = w.Close()
+				}()
+				var b [2]byte
+				_, _ = gio.ReadFull[byte](r, b[0:2])
+				require.NoError(t, r.Close())
+
+				r, w = gio.Pipe[byte]()
+				go func() {
+					_, _ = w.Write(nil)
+					_ = w.Close()
+				}()
+				_, _ = gio.ReadFull[byte](r, b[0:2])
+				require.NoError(t, r.Close())
+			},
+		},
+		{
+			name: "WriteAfterWriterClose",
+			fn: func(t *testing.T) {
+				r, w := gio.Pipe[byte]()
+				done := make(chan bool)
+				var writeErr error
+				go func() {
+					_, err := w.Write([]byte("hello"))
+					require.NoError(t, err)
+					_ = w.Close()
+					_, writeErr = w.Write([]byte("world"))
+					done <- true
+				}()
+
+				buf := make([]byte, 100)
+				n, err := gio.ReadFull[byte](r, buf)
+				require.ErrorIs(t, err, gio.ErrUnexpectedEOF)
+				<-done
+				require.Equal(t, "hello", string(buf[0:n]))
+				require.ErrorIs(t, writeErr, gio.ErrClosedPipe)
+			},
+		},
+		{
+			name: "PipeCloseErrorPreserved",
+			fn: func(t *testing.T) {
+				type testError1 struct{ error }
+				type testError2 struct{ error }
+
+				r, w := gio.Pipe[byte]()
+				_ = r.CloseWithError(testError1{})
+				_, err := w.Write(nil)
+				require.Equal(t, testError1{}, err)
+				_ = r.CloseWithError(testError2{})
+				_, err = w.Write(nil)
+				require.Equal(t, testError1{}, err)
+
+				r, w = gio.Pipe[byte]()
+				_ = w.CloseWithError(testError1{})
+				_, err = r.Read(nil)
+				require.Equal(t, testError1{}, err)
+				_ = w.CloseWithError(testError2{})
+				_, err = r.Read(nil)
+				require.Equal(t, testError1{}, err)
+			},
+		},
+		{
+			name: "PipeConcurrent",
+			fn: func(t *testing.T) {
+				const (
+					input    = "0123456789abcdef"
+					count    = 8
+					readSize = 2
+				)
+
+				t.Run("Write", func(t *testing.T) {
+					r, w := gio.Pipe[byte]()
+					for i := 0; i < count; i++ {
+						go func() {
+							time.Sleep(time.Millisecond)
+							n, err := w.Write([]byte(input))
+							require.NoError(t, err)
+							require.Equal(t, len(input), n)
+						}()
+					}
+
+					buf := make([]byte, count*len(input))
+					for i := 0; i < len(buf); i += readSize {
+						n, err := r.Read(buf[i : i+readSize])
+						require.NoError(t, err)
+						require.Equal(t, readSize, n)
+					}
+					require.Equal(t, strings.Repeat(input, count), string(buf))
+				})
+
+				t.Run("Read", func(t *testing.T) {
+					r, w := gio.Pipe[byte]()
+					c := make(chan []byte, count*len(input)/readSize)
+					for i := 0; i < cap(c); i++ {
+						go func() {
+							time.Sleep(time.Millisecond)
+							buf := make([]byte, readSize)
+							n, err := r.Read(buf)
+							require.NoError(t, err)
+							require.Equal(t, readSize, n)
+							c <- buf
+						}()
+					}
+
+					for i := 0; i < count; i++ {
+						n, err := w.Write([]byte(input))
+						require.NoError(t, err)
+						require.Equal(t, len(input), n)
+					}
+
+					got := make([]byte, 0, count*len(input))
+					for i := 0; i < cap(c); i++ {
+						got = append(got, (<-c)...)
+					}
+					got = sortBytesInGroups(got, readSize)
+					want := sortBytesInGroups(bytes.Repeat([]byte(input), count), readSize)
+					require.Equal(t, string(want), string(got))
+				})
+			},
+		},
+	} {
+		t.Run(testcase.name, testcase.fn)
+	}
+}
+
+func TestBufferedPipe(t *testing.T) {
+	for _, testcase := range [...]struct {
+		name string
+		fn   func(t *testing.T)
+	}{
+		{
+			name: "ZeroSizeFallsBackToSyncPipe",
+			fn: func(t *testing.T) {
+				r, w := gio.BufferedPipe[int](0)
+				go func() {
+					_, _ = w.Write([]int{1, 2})
+					_ = w.Close()
+				}()
+				out, err := gio.ReadAll(r)
+				require.NoError(t, err)
+				require.Equal(t, []int{1, 2}, out)
+			},
+		},
+		{
+			name: "NonBlockingWriteAndDrainAfterClose",
+			fn: func(t *testing.T) {
+				r, w := gio.BufferedPipe[int](4)
+				// Should not block because buffer capacity is 4
+				n, err := w.Write([]int{10, 20, 30})
+				require.NoError(t, err)
+				require.Equal(t, 3, n)
+
+				// Zero-length write and read
+				n, err = w.Write(nil)
+				require.NoError(t, err)
+				require.Zero(t, n)
+				n, err = r.Read(nil)
+				require.NoError(t, err)
+				require.Zero(t, n)
+
+				// Wrap-around test: read 2 items, write 3 items
+				buf := make([]int, 2)
+				n, err = r.Read(buf)
+				require.NoError(t, err)
+				require.Equal(t, 2, n)
+				require.Equal(t, []int{10, 20}, buf)
+
+				n, err = w.Write([]int{40, 50, 60})
+				require.NoError(t, err)
+				require.Equal(t, 3, n)
+				require.NoError(t, w.Close())
+
+				// Drain remaining buffered items after writer closed
+				out, err := gio.ReadAll(r)
+				require.NoError(t, err)
+				require.Equal(t, []int{30, 40, 50, 60}, out)
+			},
+		},
+		{
+			name: "BlocksWhenFullAndUnblocksOnRead",
+			fn: func(t *testing.T) {
+				r, w := gio.BufferedPipe[int](2)
+				done := make(chan struct{})
+				go func() {
+					n, err := w.Write([]int{1, 2, 3, 4, 5})
+					require.NoError(t, err)
+					require.Equal(t, 5, n)
+					_ = w.Close()
+					close(done)
+				}()
+
+				out, err := gio.ReadAll(r)
+				require.NoError(t, err)
+				require.Equal(t, []int{1, 2, 3, 4, 5}, out)
+				<-done
+			},
+		},
+		{
+			name: "CloseReadDiscardsAndFailsWrites",
+			fn: func(t *testing.T) {
+				r, w := gio.BufferedPipe[int](4)
+				_, err := w.Write([]int{1, 2})
+				require.NoError(t, err)
+
+				customErr := fmt.Errorf("custom read close")
+				require.NoError(t, r.CloseWithError(customErr))
+
+				_, err = w.Write([]int{3})
+				require.ErrorIs(t, err, customErr)
+
+				buf := make([]int, 2)
+				_, err = r.Read(buf)
+				require.ErrorIs(t, err, gio.ErrClosedPipe)
+			},
+		},
+		{
+			name: "CloseReadWhileWriterBlocked",
+			fn: func(t *testing.T) {
+				r, w := gio.BufferedPipe[int](2)
+				errCh := make(chan error, 1)
+				go func() {
+					_, err := w.Write([]int{1, 2, 3, 4})
+					errCh <- err
+				}()
+				time.Sleep(2 * time.Millisecond)
+				require.NoError(t, r.Close())
+				require.ErrorIs(t, <-errCh, gio.ErrClosedPipe)
+			},
+		},
+	} {
+		t.Run(testcase.name, testcase.fn)
+	}
 }

@@ -3,15 +3,26 @@ package gio
 import (
 	"errors"
 	"io"
+	"reflect"
 	"sync"
+	"unsafe"
 )
 
 // Seek whence values.
 const (
-	SeekStart   = 0 // seek relative to the origin of the source
-	SeekCurrent = 1 // seek relative to the current offset
-	SeekEnd     = 2 // seek relative to the end
+	SeekStart   = io.SeekStart   // seek relative to the origin of the source
+	SeekCurrent = io.SeekCurrent // seek relative to the current offset
+	SeekEnd     = io.SeekEnd     // seek relative to the end
 )
+
+// EOF is the error returned by Read when no more input is available.
+// (Read must return EOF itself, not an error wrapping EOF,
+// because callers will test for EOF using ==.)
+// Functions should return EOF only to signal a graceful end of input.
+// If the EOF occurs unexpectedly in a structured data stream,
+// the appropriate error is either [ErrUnexpectedEOF] or some other error
+// giving more detail.
+var EOF = io.EOF
 
 // ErrShortWrite means that a write accepted fewer T items than requested
 // but failed to return an explicit error.
@@ -31,6 +42,12 @@ var ErrUnexpectedEOF = io.ErrUnexpectedEOF
 // many calls to Read have failed to return any data or error,
 // usually the sign of a broken Reader implementation.
 var ErrNoProgress = io.ErrNoProgress
+
+// ErrWhence is returned by Seek when whence is invalid.
+var ErrWhence = errors.New("Seek: invalid whence")
+
+// ErrOffset is returned by Seek or WriteAt when offset is negative.
+var ErrOffset = errors.New("Seek: invalid offset")
 
 // Reader is the interface that wraps the basic Read method.
 //
@@ -53,6 +70,9 @@ var ErrNoProgress = io.ErrNoProgress
 // considering the error err. Doing so correctly handles I/O errors
 // that happen after reading some T items and also both of the
 // allowed EOF behaviors.
+//
+// If len(p) == 0, Read should always return n == 0. It may return a
+// non-nil error if some error condition is known, such as EOF.
 //
 // Implementations of Read are discouraged from returning a
 // zero T item count with a nil error, except when len(p) == 0.
@@ -81,7 +101,7 @@ type Writer[T any] interface {
 //
 // The behavior of Close after the first call is undefined.
 // Specific implementations may document their own behavior.
-type Closer io.Closer
+type Closer = io.Closer
 
 // Seeker is the interface that wraps the basic Seek method.
 //
@@ -98,7 +118,7 @@ type Closer io.Closer
 // Seeking to any positive offset may be allowed, but if the new offset exceeds
 // the size of the underlying object the behavior of subsequent I/O operations
 // is implementation-dependent.
-type Seeker io.Seeker
+type Seeker = io.Seeker
 
 // ReadWriter is the interface that groups the basic Read and Write methods.
 type ReadWriter[T any] interface {
@@ -223,35 +243,49 @@ type WriterAt[T any] interface {
 	WriteAt(p []T, off int64) (n int, err error)
 }
 
-// ItemReader is the interface that wraps the ReadItem method.
-//
-// ReadItem reads and returns the next item from the input or
-// any error encountered. If ReadItem returns an error, no input
-// item was consumed, and the returned item value is undefined.
-//
-// ReadItem provides an efficient interface for item-at-time
-// processing. A Reader that does not implement  ItemReader
-// can be wrapped using bufio.NewReader to add this method.
-type ItemReader[T any] interface {
-	ReadItem() (T, error)
+// ByteReader is the interface that wraps the ReadByte method.
+type ByteReader = io.ByteReader
+
+// ByteScanner is the interface that adds the UnreadByte method to the
+// basic ReadByte method.
+type ByteScanner = io.ByteScanner
+
+// ByteWriter is the interface that wraps the WriteByte method.
+type ByteWriter = io.ByteWriter
+
+// RuneReader is the interface that wraps the ReadRune method.
+type RuneReader = io.RuneReader
+
+// RuneScanner is the interface that adds the UnreadRune method to the
+// basic ReadRune method.
+type RuneScanner = io.RuneScanner
+
+// StringWriter is the interface that wraps the WriteString method.
+type StringWriter = io.StringWriter
+
+// WriteString writes the contents of the string s to w, which accepts a slice of bytes.
+// If w implements [StringWriter], [StringWriter.WriteString] is invoked directly.
+// Otherwise, [Writer.Write] is called exactly once.
+func WriteString(w Writer[byte], s string) (n int, err error) {
+	return io.WriteString(w, s)
 }
 
-// ItemScanner is the interface that adds the UnreadItem method to the
-// basic ReadItem method.
-//
-// UnreadItem causes the next call to ReadItem to return the last Item read.
-// If the last operation was not a successful call to ReadItem, UnreadItem may
-// return an error, unread the last item read (or the item prior to the
-// last-unread item), or (in implementations that support the Seeker interface)
-// seek to one item before the current offset.
-type ItemScanner[T any] interface {
-	ItemReader[T]
-	UnreadItem() error
-}
+const minBufItems = 64
 
-// ItemWriter is the interface that wraps the WriteItem method.
-type ItemWriter[T any] interface {
-	WriteItem(item T) error
+// defaultBufferSize returns a buffer element count targeting targetBytes of memory
+// based on unsafe.Sizeof(T), with a minimum of minBufItems (or targetBytes if smaller).
+func defaultBufferSize[T any](targetBytes int) int {
+	var zero T
+	sz := int(unsafe.Sizeof(zero))
+	if sz <= 1 {
+		return targetBytes
+	}
+	n := targetBytes / sz
+	floor := min(minBufItems, targetBytes)
+	if n < floor {
+		return floor
+	}
+	return n
 }
 
 // ReadAtLeast reads from r into buf until it has read at least min T items.
@@ -273,7 +307,7 @@ func ReadAtLeast[T any](r Reader[T], buf []T, min int) (n int, err error) {
 	}
 	if n >= min {
 		err = nil
-	} else if n > 0 && err == io.EOF {
+	} else if n > 0 && err == EOF {
 		err = ErrUnexpectedEOF
 	}
 	return
@@ -304,7 +338,7 @@ func CopyN[T any](dst Writer[T], src Reader[T], n int64) (written int64, err err
 	}
 	if written < n && err == nil {
 		// src stopped early; must have been EOF.
-		err = io.EOF
+		err = EOF
 	}
 	return
 }
@@ -347,18 +381,24 @@ func copyBuffer[T any](dst Writer[T], src Reader[T], buf []T) (written int64, er
 	if wt, ok := src.(WriterTo[T]); ok {
 		return wt.WriteTo(dst)
 	}
+	if wt, ok := any(src).(io.WriterTo); ok {
+		if w, ok := any(dst).(io.Writer); ok {
+			return wt.WriteTo(w)
+		}
+	}
 	// Similarly, if the writer has a ReadFrom method, use it to do the copy.
-	if rt, ok := dst.(ReaderFrom[T]); ok {
-		return rt.ReadFrom(src)
+	if rf, ok := dst.(ReaderFrom[T]); ok {
+		return rf.ReadFrom(src)
+	}
+	if rf, ok := any(dst).(io.ReaderFrom); ok {
+		if r, ok := any(src).(io.Reader); ok {
+			return rf.ReadFrom(r)
+		}
 	}
 	if buf == nil {
-		size := 32 * 1024
+		size := defaultBufferSize[T](32 * 1024)
 		if l, ok := src.(*LimitedReader[T]); ok && int64(size) > l.N {
-			if l.N < 1 {
-				size = 1
-			} else {
-				size = int(l.N)
-			}
+			size = int(max(l.N, 1))
 		}
 		buf = make([]T, size)
 	}
@@ -383,7 +423,7 @@ func copyBuffer[T any](dst Writer[T], src Reader[T], buf []T) (written int64, er
 			}
 		}
 		if er != nil {
-			if er != io.EOF {
+			if er != EOF {
 				err = er
 			}
 			break
@@ -408,7 +448,7 @@ type LimitedReader[T any] struct {
 
 func (l *LimitedReader[T]) Read(p []T) (n int, err error) {
 	if l.N <= 0 {
-		return 0, io.EOF
+		return 0, EOF
 	}
 	if int64(len(p)) > l.N {
 		p = p[0:l.N]
@@ -430,21 +470,22 @@ func NewSectionReader[T any](r ReaderAt[T], off int64, n int64) *SectionReader[T
 		// Assume we can read up to an offset of 1<<63 - 1.
 		remaining = maxint64
 	}
-	return &SectionReader[T]{r, off, off, remaining}
+	return &SectionReader[T]{r, off, off, remaining, n}
 }
 
 // SectionReader implements Read, Seek, and ReadAt on a section
 // of an underlying ReaderAt.
 type SectionReader[T any] struct {
-	r     ReaderAt[T]
-	base  int64
+	r     ReaderAt[T] // constant after creation
+	base  int64       // constant after creation
 	off   int64
-	limit int64
+	limit int64 // constant after creation
+	n     int64 // constant after creation
 }
 
 func (s *SectionReader[T]) Read(p []T) (n int, err error) {
 	if s.off >= s.limit {
-		return 0, io.EOF
+		return 0, EOF
 	}
 	if max := s.limit - s.off; int64(len(p)) > max {
 		p = p[0:max]
@@ -453,9 +494,6 @@ func (s *SectionReader[T]) Read(p []T) (n int, err error) {
 	s.off += int64(n)
 	return
 }
-
-var ErrWhence = errors.New("Seek: invalid whence")
-var ErrOffset = errors.New("Seek: invalid offset")
 
 func (s *SectionReader[T]) Seek(offset int64, whence int) (int64, error) {
 	switch whence {
@@ -476,15 +514,15 @@ func (s *SectionReader[T]) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (s *SectionReader[T]) ReadAt(p []T, off int64) (n int, err error) {
-	if off < 0 || off >= s.limit-s.base {
-		return 0, io.EOF
+	if off < 0 || off >= s.Size() {
+		return 0, EOF
 	}
 	off += s.base
 	if max := s.limit - off; int64(len(p)) > max {
 		p = p[0:max]
 		n, err = s.r.ReadAt(p, off)
 		if err == nil {
-			err = io.EOF
+			err = EOF
 		}
 		return n, err
 	}
@@ -493,6 +531,58 @@ func (s *SectionReader[T]) ReadAt(p []T, off int64) (n int, err error) {
 
 // Size returns the size of the section in T items.
 func (s *SectionReader[T]) Size() int64 { return s.limit - s.base }
+
+// Outer returns the underlying [ReaderAt] and offsets for the section.
+//
+// The returned values are the same that were passed to [NewSectionReader]
+// when the [SectionReader] was created.
+func (s *SectionReader[T]) Outer() (r ReaderAt[T], off int64, n int64) {
+	return s.r, s.base, s.n
+}
+
+// An OffsetWriter maps writes at offset base to offset base+off in the underlying writer.
+type OffsetWriter[T any] struct {
+	w    WriterAt[T]
+	base int64 // the original offset
+	off  int64 // the current offset
+}
+
+// NewOffsetWriter returns an [OffsetWriter] that writes to w
+// starting at offset off.
+func NewOffsetWriter[T any](w WriterAt[T], off int64) *OffsetWriter[T] {
+	return &OffsetWriter[T]{w, off, off}
+}
+
+func (o *OffsetWriter[T]) Write(p []T) (n int, err error) {
+	n, err = o.w.WriteAt(p, o.off)
+	o.off += int64(n)
+	return
+}
+
+func (o *OffsetWriter[T]) WriteAt(p []T, off int64) (n int, err error) {
+	if off < 0 {
+		return 0, ErrOffset
+	}
+
+	off += o.base
+	return o.w.WriteAt(p, off)
+}
+
+func (o *OffsetWriter[T]) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	default:
+		return 0, ErrWhence
+	case SeekStart:
+		offset += o.base
+	case SeekCurrent:
+		offset += o.off
+	}
+	if offset < o.base {
+		return 0, ErrOffset
+	}
+	o.off = offset
+	return offset - o.base, nil
+}
 
 // TeeReader returns a Reader that writes to w what it reads from r.
 // All reads from r performed through it are matched with
@@ -518,47 +608,63 @@ func (t *teeReader[T]) Read(p []T) (n int, err error) {
 	return
 }
 
-// Discard is a Writer on which all Write calls succeed
-// without doing anything.
-var Discard Writer[any] = discard[any]{}
+// Discard returns a Writer[T] on which all Write, WriteItem, WriteString,
+// and ReadFrom calls succeed without doing anything.
+func Discard[T any]() Writer[T] {
+	return discard[T]{}
+}
 
 type discard[T any] struct{}
 
-// discard implements ReaderFrom as an optimization so Copy to
-// io.Discard can avoid doing unnecessary work.
-var _ ReaderFrom[any] = discard[any]{}
+// discard implements ReaderFrom and ItemWriter as optimizations so Copy and
+// WriteItem to Discard can avoid doing unnecessary work.
+var (
+	_ ReaderFrom[any] = discard[any]{}
+	_ ItemWriter[any] = discard[any]{}
+	_ StringWriter    = discard[byte]{}
+)
 
 func (discard[T]) Write(p []T) (int, error) {
 	return len(p), nil
 }
 
-// StringWriter is the interface that wraps the WriteString method.
-type StringWriter io.StringWriter
+func (discard[T]) WriteItem(T) error {
+	return nil
+}
 
 func (discard[T]) WriteString(s string) (int, error) {
 	return len(s), nil
 }
 
-var blackHolePool sync.Pool
+var discardPools sync.Map // map[reflect.Type]*sync.Pool
 
-func (discard[T]) init() {
-	blackHolePool = sync.Pool{
+func getDiscardPool[T any]() *sync.Pool {
+	rt := reflect.TypeFor[T]()
+	if p, ok := discardPools.Load(rt); ok {
+		return p.(*sync.Pool)
+	}
+	size := defaultBufferSize[T](8192)
+	pool := &sync.Pool{
 		New: func() any {
-			b := make([]T, 8192)
+			b := make([]T, size)
 			return &b
 		},
 	}
+	actual, _ := discardPools.LoadOrStore(rt, pool)
+	return actual.(*sync.Pool)
 }
 
 func (discard[T]) ReadFrom(r Reader[T]) (n int64, err error) {
-	bufp := blackHolePool.Get().(*[]T)
+	pool := getDiscardPool[T]()
+	bufp := pool.Get().(*[]T)
 	readSize := 0
 	for {
 		readSize, err = r.Read(*bufp)
 		n += int64(readSize)
 		if err != nil {
-			blackHolePool.Put(bufp)
-			if err == io.EOF {
+			clear(*bufp)
+			pool.Put(bufp)
+			if err == EOF {
 				return n, nil
 			}
 			return
@@ -568,10 +674,13 @@ func (discard[T]) ReadFrom(r Reader[T]) (n int64, err error) {
 
 // NopCloser returns a ReadCloser with a no-op Close method wrapping
 // the provided Reader r.
-// If r implements WriterTo, the returned ReadCloser will implement WriterTo
-// by forwarding calls to r.
+// If r implements WriterTo (or io.WriterTo when T is byte), the returned
+// ReadCloser will implement WriterTo by forwarding calls to r.
 func NopCloser[T any](r Reader[T]) ReadCloser[T] {
 	if _, ok := r.(WriterTo[T]); ok {
+		return nopCloserWriterTo[T]{r}
+	}
+	if _, ok := any(r).(io.WriterTo); ok {
 		return nopCloserWriterTo[T]{r}
 	}
 	return nopCloser[T]{r}
@@ -590,7 +699,15 @@ type nopCloserWriterTo[T any] struct {
 func (nopCloserWriterTo[T]) Close() error { return nil }
 
 func (c nopCloserWriterTo[T]) WriteTo(w Writer[T]) (n int64, err error) {
-	return c.Reader.(WriterTo[T]).WriteTo(w)
+	if wt, ok := c.Reader.(WriterTo[T]); ok {
+		return wt.WriteTo(w)
+	}
+	if wt, ok := any(c.Reader).(io.WriterTo); ok {
+		if iw, ok := any(w).(io.Writer); ok {
+			return wt.WriteTo(iw)
+		}
+	}
+	return copyBuffer(w, c.Reader, nil)
 }
 
 // ReadAll reads from r until an error or EOF and returns the data it read.
@@ -598,20 +715,36 @@ func (c nopCloserWriterTo[T]) WriteTo(w Writer[T]) (n int64, err error) {
 // defined to read from src until EOF, it does not treat an EOF from Read
 // as an error to be reported.
 func ReadAll[T any](r Reader[T]) ([]T, error) {
-	b := make([]T, 0, 512)
+	initCap := defaultBufferSize[T](512)
+	b := make([]T, 0, initCap)
+	next := max(initCap/2, 16)
+	chunks := make([][]T, 0, 4)
+	var finalSize int
 	for {
-		if len(b) == cap(b) {
-			// Add more capacity (let append pick how much).
-			var zero T
-			b = append(b, zero)[:len(b)]
-		}
 		n, err := r.Read(b[len(b):cap(b)])
 		b = b[:len(b)+n]
 		if err != nil {
-			if err == io.EOF {
+			if err == EOF {
 				err = nil
 			}
-			return b, err
+			if len(chunks) == 0 {
+				return b, err
+			}
+
+			finalSize += len(b)
+			final := make([]T, 0, finalSize)
+			for _, chunk := range chunks {
+				final = append(final, chunk...)
+			}
+			final = append(final, b...)
+			return final, err
+		}
+
+		if cap(b)-len(b) < max(cap(b)/16, 1) {
+			chunks = append(chunks, b)
+			finalSize += len(b)
+			b = make([]T, 0, next)
+			next += next / 2
 		}
 	}
 }

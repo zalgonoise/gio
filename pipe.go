@@ -19,6 +19,7 @@ func (a *onceError) Store(err error) {
 	}
 	a.err = err
 }
+
 func (a *onceError) Load() error {
 	a.Lock()
 	defer a.Unlock()
@@ -38,9 +39,14 @@ type pipe[T any] struct {
 	done chan struct{}
 	rerr onceError
 	werr onceError
+
+	bp *bufferedPipe[T]
 }
 
 func (p *pipe[T]) read(b []T) (n int, err error) {
+	if p.bp != nil {
+		return p.bp.read(b)
+	}
 	select {
 	case <-p.done:
 		return 0, p.readCloseError()
@@ -58,6 +64,9 @@ func (p *pipe[T]) read(b []T) (n int, err error) {
 }
 
 func (p *pipe[T]) closeRead(err error) error {
+	if p.bp != nil {
+		return p.bp.closeRead(err)
+	}
 	if err == nil {
 		err = ErrClosedPipe
 	}
@@ -67,6 +76,9 @@ func (p *pipe[T]) closeRead(err error) error {
 }
 
 func (p *pipe[T]) write(b []T) (n int, err error) {
+	if p.bp != nil {
+		return p.bp.write(b)
+	}
 	select {
 	case <-p.done:
 		return 0, p.writeCloseError()
@@ -89,8 +101,11 @@ func (p *pipe[T]) write(b []T) (n int, err error) {
 }
 
 func (p *pipe[T]) closeWrite(err error) error {
+	if p.bp != nil {
+		return p.bp.closeWrite(err)
+	}
 	if err == nil {
-		err = io.EOF
+		err = EOF
 	}
 	p.werr.Store(err)
 	p.once.Do(func() { close(p.done) })
@@ -117,7 +132,7 @@ func (p *pipe[T]) writeCloseError() error {
 
 // A PipeReader is the read half of a pipe.
 type PipeReader[T any] struct {
-	p *pipe[T]
+	pipe[T]
 }
 
 // Read implements the standard Read interface:
@@ -126,7 +141,14 @@ type PipeReader[T any] struct {
 // If the write end is closed with an error, that error is
 // returned as err; otherwise err is EOF.
 func (r *PipeReader[T]) Read(data []T) (n int, err error) {
-	return r.p.read(data)
+	return r.pipe.read(data)
+}
+
+// ReadItem reads and returns a single T item from the pipe.
+func (r *PipeReader[T]) ReadItem() (item T, err error) {
+	var buf [1]T
+	_, err = ReadFull(r, buf[:])
+	return buf[0], err
 }
 
 // Close closes the reader; subsequent writes to the
@@ -141,12 +163,12 @@ func (r *PipeReader[T]) Close() error {
 // CloseWithError never overwrites the previous error if it exists
 // and always returns nil.
 func (r *PipeReader[T]) CloseWithError(err error) error {
-	return r.p.closeRead(err)
+	return r.pipe.closeRead(err)
 }
 
 // A PipeWriter is the write half of a pipe.
 type PipeWriter[T any] struct {
-	p *pipe[T]
+	r PipeReader[T]
 }
 
 // Write implements the standard Write interface:
@@ -155,7 +177,14 @@ type PipeWriter[T any] struct {
 // If the read end is closed with an error, that err is
 // returned as err; otherwise err is ErrClosedPipe.
 func (w *PipeWriter[T]) Write(data []T) (n int, err error) {
-	return w.p.write(data)
+	return w.r.pipe.write(data)
+}
+
+// WriteItem writes a single T item to the pipe.
+func (w *PipeWriter[T]) WriteItem(item T) error {
+	buf := [1]T{item}
+	_, err := w.Write(buf[:])
+	return err
 }
 
 // Close closes the writer; subsequent reads from the
@@ -171,7 +200,7 @@ func (w *PipeWriter[T]) Close() error {
 // CloseWithError never overwrites the previous error if it exists
 // and always returns nil.
 func (w *PipeWriter[T]) CloseWithError(err error) error {
-	return w.p.closeWrite(err)
+	return w.r.pipe.closeWrite(err)
 }
 
 // Pipe creates a synchronous in-memory pipe.
@@ -190,10 +219,165 @@ func (w *PipeWriter[T]) CloseWithError(err error) error {
 // Parallel calls to Read and parallel calls to Write are also safe:
 // the individual calls will be gated sequentially.
 func Pipe[T any]() (*PipeReader[T], *PipeWriter[T]) {
-	p := &pipe[T]{
+	pw := &PipeWriter[T]{r: PipeReader[T]{pipe: pipe[T]{
 		wrCh: make(chan []T),
 		rdCh: make(chan int),
 		done: make(chan struct{}),
+	}}}
+	return &pw.r, pw
+}
+
+// BufferedPipe creates a bounded asynchronous in-memory pipe with a ring buffer
+// of capacity size T items. If size <= 0, it behaves identically to [Pipe].
+//
+// Writes to the PipeWriter do not block as long as the internal buffer has
+// sufficient capacity. Once the buffer is full, Write blocks until a Read
+// frees capacity or the PipeReader is closed.
+//
+// When the PipeWriter is closed, any buffered items remain available to Read
+// before EOF (or the close error) is returned.
+func BufferedPipe[T any](size int) (*PipeReader[T], *PipeWriter[T]) {
+	if size <= 0 {
+		return Pipe[T]()
 	}
-	return &PipeReader[T]{p}, &PipeWriter[T]{p}
+	bp := &bufferedPipe[T]{
+		buf: make([]T, size),
+	}
+	bp.notEmpty = sync.NewCond(&bp.mu)
+	bp.notFull = sync.NewCond(&bp.mu)
+
+	pw := &PipeWriter[T]{r: PipeReader[T]{pipe: pipe[T]{
+		bp: bp,
+	}}}
+	return &pw.r, pw
+}
+
+type bufferedPipe[T any] struct {
+	wrMu     sync.Mutex
+	mu       sync.Mutex
+	notEmpty *sync.Cond
+	notFull  *sync.Cond
+
+	buf     []T
+	head    int
+	count   int
+	rClosed bool
+	wClosed bool
+	rerr    error
+	werr    error
+}
+
+func (bp *bufferedPipe[T]) read(b []T) (n int, err error) {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+
+	for {
+		if bp.rClosed {
+			return 0, bp.readCloseErrorLocked()
+		}
+		if bp.count > 0 {
+			if len(b) == 0 {
+				return 0, nil
+			}
+			for n < len(b) && bp.count > 0 {
+				avail := min(bp.count, len(bp.buf)-bp.head, len(b)-n)
+				copy(b[n:n+avail], bp.buf[bp.head:bp.head+avail])
+				clear(bp.buf[bp.head : bp.head+avail])
+				bp.head = (bp.head + avail) % len(bp.buf)
+				bp.count -= avail
+				n += avail
+			}
+			bp.notFull.Broadcast()
+			return n, nil
+		}
+		if bp.wClosed {
+			return 0, bp.readCloseErrorLocked()
+		}
+		bp.notEmpty.Wait()
+	}
+}
+
+func (bp *bufferedPipe[T]) write(b []T) (n int, err error) {
+	bp.mu.Lock()
+	if bp.rClosed || bp.wClosed {
+		err = bp.writeCloseErrorLocked()
+		bp.mu.Unlock()
+		return 0, err
+	}
+	bp.mu.Unlock()
+
+	bp.wrMu.Lock()
+	defer bp.wrMu.Unlock()
+
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+
+	for once := true; once || len(b) > 0; once = false {
+		for bp.count == len(bp.buf) && len(b) > 0 && !bp.rClosed && !bp.wClosed {
+			bp.notFull.Wait()
+		}
+		if bp.rClosed || bp.wClosed {
+			return n, bp.writeCloseErrorLocked()
+		}
+		if len(b) == 0 {
+			return n, nil
+		}
+		for len(b) > 0 && bp.count < len(bp.buf) {
+			tail := (bp.head + bp.count) % len(bp.buf)
+			space := min(len(bp.buf)-bp.count, len(bp.buf)-tail, len(b))
+			copy(bp.buf[tail:tail+space], b[:space])
+			bp.count += space
+			b = b[space:]
+			n += space
+		}
+		bp.notEmpty.Broadcast()
+	}
+	return n, nil
+}
+
+func (bp *bufferedPipe[T]) closeRead(err error) error {
+	if err == nil {
+		err = ErrClosedPipe
+	}
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	if bp.rerr == nil {
+		bp.rerr = err
+	}
+	bp.rClosed = true
+	clear(bp.buf)
+	bp.count = 0
+	bp.head = 0
+	bp.notEmpty.Broadcast()
+	bp.notFull.Broadcast()
+	return nil
+}
+
+func (bp *bufferedPipe[T]) closeWrite(err error) error {
+	if err == nil {
+		err = EOF
+	}
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	if bp.werr == nil {
+		bp.werr = err
+	}
+	bp.wClosed = true
+	bp.notEmpty.Broadcast()
+	bp.notFull.Broadcast()
+	return nil
+}
+
+func (bp *bufferedPipe[T]) readCloseErrorLocked() error {
+	if bp.rerr == nil && bp.werr != nil {
+		return bp.werr
+	}
+	return ErrClosedPipe
+}
+
+func (bp *bufferedPipe[T]) writeCloseErrorLocked() error {
+	if bp.werr == nil && bp.rerr != nil {
+		return bp.rerr
+	}
+	return ErrClosedPipe
 }

@@ -1,11 +1,9 @@
 package gio
 
-import "io"
-
 type eofReader[T any] struct{}
 
 func (eofReader[T]) Read([]T) (int, error) {
-	return 0, io.EOF
+	return 0, EOF
 }
 
 type multiReader[T any] struct {
@@ -22,25 +20,25 @@ func (mr *multiReader[T]) Read(p []T) (n int, err error) {
 			}
 		}
 		n, err = mr.readers[0].Read(p)
-		if err == io.EOF {
+		if err == EOF {
 			// Use eofReader instead of nil to avoid nil panic
 			// after performing flatten (Issue 18232).
 			mr.readers[0] = eofReader[T]{} // permit earlier GC
 			mr.readers = mr.readers[1:]
 		}
-		if n > 0 || err != io.EOF {
-			if err == io.EOF && len(mr.readers) > 0 {
+		if n > 0 || err != EOF {
+			if err == EOF && len(mr.readers) > 0 {
 				// Don't return EOF yet. More readers remain.
 				err = nil
 			}
 			return
 		}
 	}
-	return 0, io.EOF
+	return 0, EOF
 }
 
 func (mr *multiReader[T]) WriteTo(w Writer[T]) (sum int64, err error) {
-	return mr.writeToWithBuffer(w, make([]T, 1024*32))
+	return mr.writeToWithBuffer(w, make([]T, defaultBufferSize[T](1024*32)))
 }
 
 func (mr *multiReader[T]) writeToWithBuffer(w Writer[T], buf []T) (sum int64, err error) {
@@ -66,7 +64,7 @@ var _ WriterTo[any] = (*multiReader[any])(nil)
 
 // MultiReader returns a Reader that's the logical concatenation of
 // the provided input readers. They're read sequentially. Once all
-// inputs have returned EOF, Read will return EOF.  If any of the readers
+// inputs have returned EOF, Read will return EOF. If any of the readers
 // return a non-nil, non-EOF error, Read will return that error.
 func MultiReader[T any](readers ...Reader[T]) Reader[T] {
 	r := make([]Reader[T], len(readers))
@@ -90,6 +88,44 @@ func (t *multiWriter[T]) Write(p []T) (n int, err error) {
 		}
 	}
 	return len(p), nil
+}
+
+var (
+	_ StringWriter    = (*multiWriter[byte])(nil)
+	_ ItemWriter[any] = (*multiWriter[any])(nil)
+)
+
+func (t *multiWriter[T]) WriteString(s string) (n int, err error) {
+	var p []byte // lazily initialized if/when needed
+	for _, w := range t.writers {
+		if sw, ok := any(w).(StringWriter); ok {
+			n, err = sw.WriteString(s)
+		} else if bw, ok := any(w).(Writer[byte]); ok {
+			if p == nil {
+				p = []byte(s)
+			}
+			n, err = bw.Write(p)
+		} else {
+			return 0, ErrInvalidWrite
+		}
+		if err != nil {
+			return
+		}
+		if n != len(s) {
+			err = ErrShortWrite
+			return
+		}
+	}
+	return len(s), nil
+}
+
+func (t *multiWriter[T]) WriteItem(item T) error {
+	for _, w := range t.writers {
+		if err := WriteItem(w, item); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // MultiWriter creates a writer that duplicates its writes to all the
